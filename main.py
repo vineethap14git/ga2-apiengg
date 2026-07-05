@@ -17,9 +17,7 @@ TOTAL_ORDERS = 52
 RATE_LIMIT = 18
 RATE_WINDOW_SECONDS = 10
 
-ALLOWED_ORIGINS = [
-    "https://exam.sanand.workers.dev",
-]
+ALLOWED_ORIGINS = ["*"]
 
 # -----------------------------
 # CORS
