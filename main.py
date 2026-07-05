@@ -12,12 +12,8 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://exam.sanand.workers.dev",
-        "https://app-xxqt4l.example.com",
-        "*"
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -46,16 +42,19 @@ catalog = [
 @app.middleware("http")
 async def limit_requests(request: Request, call_next):
 
+    # Don't rate limit CORS preflight requests
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
     client = request.headers.get("X-Client-Id", "default")
 
     now = time.time()
 
     timestamps = rate_limits.get(client, [])
-
     timestamps = [t for t in timestamps if now - t < WINDOW]
 
     if len(timestamps) >= RATE_LIMIT:
-        retry = int(WINDOW - (now - timestamps[0])) + 1
+        retry = max(1, int(WINDOW - (now - timestamps[0])))
 
         return JSONResponse(
             status_code=429,
