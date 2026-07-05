@@ -1,116 +1,134 @@
 from fastapi import FastAPI, Request, Header, HTTPException
+from fastapi.responses import JSONResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from typing import Optional
-import uuid
+
+from collections import defaultdict, deque
+from threading import Lock
 import time
+import math
 import base64
 
 app = FastAPI()
 
-# ---------------- CORS ----------------
+# -----------------------------
+# CONFIG
+# -----------------------------
+TOTAL_ORDERS = 52
+RATE_LIMIT = 18
+RATE_WINDOW_SECONDS = 10
 
+ALLOWED_ORIGINS = [
+    "https://exam.sanand.workers.dev",
+]
+
+# -----------------------------
+# CORS
+# -----------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["Retry-After"],
 )
 
-# ---------------- CONFIG ----------------
+# -----------------------------
+# In-memory storage
+# -----------------------------
+orders = []
+idempotency_store = {}
 
-TOTAL_ORDERS = 52
-RATE_LIMIT = 18
-WINDOW = 10  # seconds
+rate_buckets = defaultdict(deque)
+state_lock = Lock()
 
-# ---------------- STORAGE ----------------
+# fixed catalog
+catalog = [{"id": i, "item": f"Order {i}"} for i in range(1, TOTAL_ORDERS + 1)]
 
-created_orders = {}      # idempotency_key -> order
-rate_limits = {}         # client_id -> timestamps
-
-catalog = [
-    {
-        "id": i,
-        "item": f"Order {i}"
-    }
-    for i in range(1, TOTAL_ORDERS + 1)
-]
-
-# ---------------- RATE LIMIT ----------------
-
+# -----------------------------
+# Rate limit middleware
+# -----------------------------
 @app.middleware("http")
-async def limit_requests(request: Request, call_next):
+async def per_client_rate_limit(request: Request, call_next):
 
-    # Don't rate limit CORS preflight requests
     if request.method == "OPTIONS":
         return await call_next(request)
 
-    client = request.headers.get("X-Client-Id", "default")
+    client_id = request.headers.get("X-Client-Id", "anonymous")
+    now = time.monotonic()
 
-    now = time.time()
+    with state_lock:
+        bucket = rate_buckets[client_id]
 
-    timestamps = rate_limits.get(client, [])
-    timestamps = [t for t in timestamps if now - t < WINDOW]
+        while bucket and now - bucket[0] >= RATE_WINDOW_SECONDS:
+            bucket.popleft()
 
-    if len(timestamps) >= RATE_LIMIT:
-        retry = max(1, int(WINDOW - (now - timestamps[0])))
+        if len(bucket) >= RATE_LIMIT:
 
-        return JSONResponse(
-            status_code=429,
-            content={"detail": "Rate limit exceeded"},
-            headers={"Retry-After": str(retry)}
-        )
+            retry_after = max(
+                1,
+                math.ceil(RATE_WINDOW_SECONDS - (now - bucket[0]))
+            )
 
-    timestamps.append(now)
-    rate_limits[client] = timestamps
+            headers = {
+                "Retry-After": str(retry_after)
+            }
 
-    return await call_next(request)
+            return Response(
+                status_code=429,
+                content='{"detail":"Rate limit exceeded"}',
+                media_type="application/json",
+                headers=headers
+            )
 
-# ---------------- POST /orders ----------------
+        bucket.append(now)
 
+    response = await call_next(request)
+    return response
+
+
+# -----------------------------
+# POST /orders
+# -----------------------------
 @app.post("/orders", status_code=201)
-async def create_order(
-    request: Request,
-    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key")
+def create_order(
+    request: dict,
+    idempotency_key: str = Header(...)
 ):
 
-    if not idempotency_key:
-        raise HTTPException(400, "Missing Idempotency-Key")
-
-    if idempotency_key in created_orders:
-        return created_orders[idempotency_key]
-
-    body = await request.json()
+    if idempotency_key in idempotency_store:
+        return idempotency_store[idempotency_key]
 
     order = {
-        "id": str(uuid.uuid4()),
-        **body
+        "id": len(orders) + 1,
+        **request
     }
 
-    created_orders[idempotency_key] = order
+    orders.append(order)
+    idempotency_store[idempotency_key] = order
 
     return order
 
-# ---------------- GET /orders ----------------
 
+# -----------------------------
+# GET /orders
+# -----------------------------
 @app.get("/orders")
-async def list_orders(limit: int = 10, cursor: Optional[str] = None):
+def get_orders(limit: int = 10, cursor: str | None = None):
 
     start = 0
 
     if cursor:
         start = int(base64.b64decode(cursor).decode())
 
-    end = min(start + limit, TOTAL_ORDERS)
-
-    items = catalog[start:end]
+    items = catalog[start:start + limit]
 
     next_cursor = None
 
-    if end < TOTAL_ORDERS:
-        next_cursor = base64.b64encode(str(end).encode()).decode()
+    if start + limit < len(catalog):
+        next_cursor = base64.b64encode(
+            str(start + limit).encode()
+        ).decode()
 
     return {
         "items": items,
